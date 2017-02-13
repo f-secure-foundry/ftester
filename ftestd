@@ -1,0 +1,253 @@
+#!/usr/bin/perl 
+#
+# FTester sniffer v1.0
+# Copyright (C) 2001-2006 Andrea Barisani <andrea@inversepath.com>
+#  
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 as 
+# published by the Free Software Foundation.
+
+use strict;
+use Getopt::Std;
+use Net::RawIP;
+use Net::PcapUtils;
+use NetPacket::Ethernet qw(:strip);
+use NetPacket::IP qw(:strip);
+use NetPacket::TCP;
+use NetPacket::UDP;
+use NetPacket::ICMP;
+getopts('c:gi:m:v');
+
+our($opt_c, $opt_g, $opt_i, $opt_m, $opt_v);
+my ($src_port, $dst_port, $data, $flags, $seq);
+
+my $verbose     = $opt_v;
+my $fragments   = $opt_g;
+my $interface	= $opt_i; 
+my $marker      = $opt_m;
+my $connect_ack = 'connect_ack';
+
+die
+"FTester sniffer v1.0\nCopyright (C) 2001-2006 Andrea Barisani <andrea\@inversepath.com>\n\nConfiguration options:\n  -i <interface>\n  -g <fragments reassembly>\n  -m <marker>\n  -v <verbose>\n\nConnection options:\n  -c <ttl1:ttl2> (ttl1 setting currently works only on Linux systems)\n  -m <marker>\n\n"
+  unless $opt_i;
+
+my @ttls = split (/:/, $opt_c) if $opt_c;
+system "echo $ttls[0] > /proc/sys/net/ipv4/ip_default_ttl" if ($opt_c and `uname -a` =~ /Linux/);
+$ttls[1] = 200 if !($opt_c);
+
+print "Firewall Tester sniffer v.1.0\n";
+print "Copyright (C) 2001-2006 Andrea Barisani <andrea\@inversepath.com>\n\n";
+print "default system TTL = $ttls[0]";
+print "  FAILED!\nCurrently only Linux is supported, you have to manually set the value.\nPlease notify any necessary info if you like a fix." if ($opt_c and `uname -a` !~ /Linux/);
+print "\n";
+print "replies TTL        = $ttls[1]\n";
+print "marker             = $marker\n" if ($marker);
+print "listening on $interface\n\n"; 
+
+open(OUT, ">>./ftestd$marker.log") || die "cannot create log file";
+print OUT ("# ftestd started on ".`date`);
+
+my $count = 0;
+my @flags_table;
+
+for ( $count = 0; $count < 64; $count++ ) {
+    $flags_table[$count] = "$flags_table[$count]P" if $count & 8;
+    $flags_table[$count] = "$flags_table[$count]U" if $count & 32;
+    $flags_table[$count] = "$flags_table[$count]S" if $count & 2;
+    $flags_table[$count] = "$flags_table[$count]A" if $count & 16;
+    $flags_table[$count] = "$flags_table[$count]F" if $count & 1;
+    $flags_table[$count] = "$flags_table[$count]R" if $count & 4;
+}
+
+sub process_pkt {
+    my ($arg, $hdr, $pkt) = @_;
+    my $ip_obj   = NetPacket::IP->decode(eth_strip($pkt));
+    my $tcp_obj  = NetPacket::TCP->decode(ip_strip( eth_strip($pkt)));
+    my $udp_obj  = NetPacket::UDP->decode(ip_strip( eth_strip($pkt)));
+    my $icmp_obj = NetPacket::ICMP->decode(ip_strip( eth_strip($pkt)));
+
+    if ($fragments) {
+
+        if ( $ip_obj->{flags} eq '1' and $ip_obj->{foffset} eq '0' ) {
+	    if ( $ip_obj->{proto} eq '6' ) {
+                $data     = $tcp_obj->{data};
+	        $src_port = $tcp_obj->{src_port};
+	        $dst_port = $tcp_obj->{dest_port};
+	        $flags    = $tcp_obj->{flags};
+	    }
+    	    if ( $ip_obj->{proto} eq '17' ) {
+                $data     = $udp_obj->{data};
+	        $src_port = $udp_obj->{src_port};
+	        $dst_port = $udp_obj->{dest_port};
+	        $flags    = $udp_obj->{flags};
+	    }
+        }
+
+        if ( $ip_obj->{foffset} ne '0' ) {
+	    if ( $ip_obj->{proto} eq '6' ) {
+	        $data = $data . $ip_obj->{data};
+                $tcp_obj->{data} = $data;
+	    }
+	    if ( $ip_obj->{proto} eq '17' ) {
+	        $data = $data . $ip_obj->{data};
+                $udp_obj->{data} = $data;
+	    }
+            $tcp_obj->{data}      = $data;
+            $tcp_obj->{src_port}  = $src_port;
+            $tcp_obj->{dest_port} = $dst_port;
+            $tcp_obj->{flags}     = $flags;
+    
+            $udp_obj->{data}      = $data;
+            $udp_obj->{src_port}  = $src_port;
+            $udp_obj->{dest_port} = $dst_port;
+            $udp_obj->{flags}     = $flags;
+        }	
+    }	
+   
+    if ( $tcp_obj->{data} =~ /ftestertcpprobe$marker/ ) {
+        open(OUT, ">>./ftestd$marker.log");
+        print("$ip_obj->{id} - $ip_obj->{src_ip}:$tcp_obj->{src_port} > $ip_obj->{dest_ip}:$tcp_obj->{dest_port} $flags_table[$tcp_obj->{flags}] TCP $ip_obj->{tos}\n")
+          if $verbose;
+        print OUT ("$ip_obj->{id} - $ip_obj->{src_ip}:$tcp_obj->{src_port} > $ip_obj->{dest_ip}:$tcp_obj->{dest_port} $flags_table[$tcp_obj->{flags}] TCP $ip_obj->{tos}\n");
+    }
+
+    if ( $udp_obj->{data} =~ /ftesterudpprobe$marker/ ) {
+        open(OUT, ">>./ftestd$marker.log");
+        print("$ip_obj->{id} - $ip_obj->{src_ip}:$udp_obj->{src_port} > $ip_obj->{dest_ip}:$udp_obj->{dest_port} UDP $ip_obj->{tos}\n")
+          if $verbose;
+        print OUT ("$ip_obj->{id} - $ip_obj->{src_ip}:$udp_obj->{src_port} > $ip_obj->{dest_ip}:$udp_obj->{dest_port} UDP $ip_obj->{tos}\n");
+    }
+
+    if ( $icmp_obj->{data} =~ /ftestericmpprobe$marker/ ) {
+        open(OUT, ">>./ftestd$marker.log");
+        print("$ip_obj->{id} - $ip_obj->{src_ip} > $ip_obj->{dest_ip} ICMP $icmp_obj->{type} $icmp_obj->{code}\n")
+          if $verbose;
+        print OUT ("$ip_obj->{id} - $ip_obj->{src_ip} > $ip_obj->{dest_ip} ICMP $icmp_obj->{type} $icmp_obj->{code}\n");
+    }
+
+    if ( $tcp_obj->{data} =~ /seqprobe$marker/ ) {
+        print("\nReceived Syn Probe: $ip_obj->{src_ip}:$tcp_obj->{src_port} > $ip_obj->{dest_ip}:$tcp_obj->{dest_port} $flags_table[$tcp_obj->{flags}] TCP\n")
+          if $verbose;
+
+        my $ack_seq = ($tcp_obj->{seqnum})+8;
+        $seq        = ($tcp_obj->{seqnum})+1024;
+
+        $a = new Net::RawIP(
+            {
+                ip => {
+                    ttl     => $ttls[1],
+                    id      => 1,
+                    saddr   => $ip_obj->{dest_ip},
+                    daddr   => $ip_obj->{src_ip},
+                },
+                tcp => {
+                    source  => $tcp_obj->{dest_port},
+                    dest    => $tcp_obj->{src_port},
+                    syn     => 1,
+                    ack     => 1,
+                    seq     => $seq,
+                    ack_seq => $ack_seq,
+                }
+            }
+        );
+        $a->send(0.01,1);
+        print("Sent Syn Ack Reply: $ip_obj->{dest_ip}:$tcp_obj->{dest_port} > $ip_obj->{src_ip}:$tcp_obj->{src_port} SA TCP\n\n")
+          if $verbose;
+    }
+
+    if ( $tcp_obj->{data} =~ /ackme$marker/ ) {
+        print("\nReceived Ack request: $ip_obj->{src_ip}:$tcp_obj->{src_port} > $ip_obj->{dest_ip}:$tcp_obj->{dest_port} $flags_table[$tcp_obj->{flags}] TCP\n")
+          if $verbose;
+
+        my $n       = length ($tcp_obj->{data});
+        my $ack_seq = ($tcp_obj->{seqnum})+$n;
+        
+        $a = new Net::RawIP(
+            {
+                ip => {
+                    ttl     => $ttls[1],
+                    id      => 2,
+                    saddr   => $ip_obj->{dest_ip},
+                    daddr   => $ip_obj->{src_ip},
+                },
+                tcp => {
+                    source  => $tcp_obj->{dest_port},
+                    dest    => $tcp_obj->{src_port},
+                    syn     => 0,
+                    ack     => 1,
+                    seq     => $seq+1,
+                    ack_seq => $ack_seq,
+                }
+            }
+        );
+        $a->send(0.01,1);
+        print("Sent Ack Reply: $ip_obj->{dest_ip}:$tcp_obj->{dest_port} > $ip_obj->{src_ip}:$tcp_obj->{src_port} A TCP\n\n")
+          if $verbose;
+    }
+
+    if ( $tcp_obj->{data} =~ /finme$marker/ ) { 
+        print("Received FIN request: $ip_obj->{src_ip}:$tcp_obj->{src_port} > $ip_obj->{dest_ip}:$tcp_obj->{dest_port} $flags_table[$tcp_obj->{flags}] TCP\n")
+          if $verbose;
+
+        my $n       = length ($tcp_obj->{data});
+        my $ack_seq = ($tcp_obj->{seqnum})+$n;
+        
+        $a = new Net::RawIP(
+            {
+                ip => {
+                    ttl     => $ttls[1],
+                    id      => 2,
+                    saddr   => $ip_obj->{dest_ip},
+                    daddr   => $ip_obj->{src_ip},
+                },
+                tcp => {
+                    source  => $tcp_obj->{dest_port},
+                    dest    => $tcp_obj->{src_port},
+                    syn     => 0,
+                    ack     => 1,
+                    fin     => 0,
+                    seq     => $seq+1,
+                    ack_seq => $ack_seq,
+                }
+            }
+        );
+        $a->send(0.01,1);
+        print("Sent FIN Reply: $ip_obj->{dest_ip}:$tcp_obj->{dest_port} > $ip_obj->{src_ip}:$tcp_obj->{src_port} A TCP\n")
+          if $verbose;
+         
+        $a = new Net::RawIP(
+            {
+                ip => {
+                    ttl     => $ttls[1],
+                    id      => 2,
+                    saddr   => $ip_obj->{dest_ip},
+                    daddr   => $ip_obj->{src_ip},
+                },
+                tcp => {
+                    source  => $tcp_obj->{dest_port},
+                    dest    => $tcp_obj->{src_port},
+                    syn     => 0,
+                    ack     => 1,
+                    fin     => 1,
+                    seq     => $seq+1,
+                    ack_seq => $ack_seq,
+                }
+            }
+        );
+        $a->send(0.01,1);
+        print("Sent FIN request: $ip_obj->{dest_ip}:$tcp_obj->{dest_port} > $ip_obj->{src_ip}:$tcp_obj->{src_port} F TCP\n")
+          if $verbose;
+   }
+
+    if ( $tcp_obj->{data} =~ /ftesterstop$marker/ ) {
+        print("Stop packet => $ip_obj->{src_ip}:$tcp_obj->{src_port} > $ip_obj->{dest_ip}:$tcp_obj->{dest_port} $flags_table[$tcp_obj->{flags}] TCP\n")
+          if $verbose;
+        print OUT ("$ip_obj->{id} - $ip_obj->{src_ip}:$tcp_obj->{src_port} > $ip_obj->{dest_ip}:$tcp_obj->{dest_port} $flags_table[$tcp_obj->{flags}] TCP $ip_obj->{tos}\n");
+        print OUT ("# ftestd finished on ".`date`);
+        close(OUT);
+        system "echo 64 > /proc/sys/net/ipv4/ip_default_ttl" if $opt_c;
+        die "received disconnection signal";
+    }
+}
+
+Net::PcapUtils::loop(\&process_pkt, FILTER => 'ip', DEV => $interface);

@@ -1,0 +1,84 @@
+#!/usr/bin/perl 
+#
+# FTester log parser v1.0
+# Copyright (C) 2001-2006 Andrea Barisani <andrea@inversepath.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 as 
+# published by the Free Software Foundation.
+
+use strict;
+
+my (@log, @logd, @id, @authorized, @filtered, @orig, @nat);
+
+open LOG,  "$ARGV[0]" || die "Usage $0 ftest.log ftestd.log";
+open LOGD, "$ARGV[1]" || die "Usage $0 ftest.log ftestd.log";
+
+while (<LOG>) {
+    next unless /^[0-9]+\s-\s/;
+    next if     /^IDS/;
+    my @fields = split /\s-\s/;
+    $log[($fields[0] - 1)] = $_;
+}
+
+while (<LOGD>) {
+    next unless /^[0-9]+\s-\s/;
+    next if     /^IDS/;
+    my @fieldsd = split /\s-\s/;
+    $logd[($fieldsd[0] - 1)] = $_;
+}
+
+close LOG;
+close LOGD;
+
+chomp @log;
+chomp @logd;
+
+my $i = 0;
+
+foreach (@log) {
+    if ($logd[$i] and ($log[$i] eq $logd[$i])) {
+        push (@authorized, $log[$i]);
+    }
+    elsif (!$logd[$i]) {
+        push (@filtered, $log[$i]);
+    }
+    else {
+        push (@orig, $log[$i]);
+        push (@nat,  $logd[$i]);
+    }
+    $i++;
+}
+
+print("\n");
+print("Authorized packets:\n");
+print("-------------------\n");
+print("\n");
+foreach (@authorized) {
+    next if !($_);
+    print($_, "\n");
+}
+
+print("\n");
+print("Modified packets (probably NAT):\n");
+print("--------------------------------\n");
+print("\n");
+foreach (@orig) {
+    next if !($_);
+    print($_, "\n");
+}
+print("		>>>>>>>>\n");
+foreach (@nat) {
+    next if !($_);
+    print($_, "\n");
+}
+
+print("\n");
+print("Filtered or dropped packets:\n");
+print("----------------------------\n");
+print("\n");
+foreach (@filtered) {
+    next if !($_);
+    print($_, "\n");
+}
+print("\n");

@@ -1,0 +1,1586 @@
+#!/usr/bin/perl
+#
+# FTester client v1.0
+# Copyright (C) 2001-2006 Andrea Barisani <andrea@inversepath.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 as 
+# published by the Free Software Foundation.
+
+use strict;
+use Getopt::Std;
+use POSIX;
+use Net::RawIP;
+use NetPacket::IP qw(:strip);
+use NetPacket::TCP;
+use NetPacket::UDP;
+getopts('c:d:e:Ff:g:k:m:p:rs:t:v');
+
+our($opt_c, $opt_d, $opt_e, $opt_f, $opt_F, $opt_g, $opt_k, $opt_m, $opt_p, $opt_r, $opt_s, $opt_t, $opt_v);
+
+die
+"FTester client v1.0\nCopyright (C) 2001-2006 Andrea Barisani <andrea\@inversepath.com>\n\nConfiguration options:\n  -f <conf_file>\n  -c <source_ip>:<source_port>:<dest_ip>:<dest_port>:<flags>:<protocol>:<tos>\n  -v <verbose>\n\nTiming options:\n  -d <delay, 0.25 = 250 ms>\n  -s <sleep time, 1 = 1 s>\n\nEvasion options:\n  -e <evasion method>\n  -t <ids_ttl>\n\nConnection options:\n  -r <reset connection>\n  -F <end connection>\n  -g <IP fragments number, es. 4|IP fragments size, es. 16b>\n  -p <TCP segments number, es. 4|TCP segments size, es 6b>\n  -k <cksum value, es. 60000>\n  -m <marker>\n\n"
+  unless ($opt_f || $opt_c);
+
+my $delay        = $opt_d || 0.01;
+my $sleep	 = $opt_s || 1;
+my $fragment     = $opt_g || 0;
+my $segments     = $opt_p || 0;
+my $evasion      = $opt_e || 0;
+my $verbose      = $opt_v || 0;
+my $reset        = $opt_r;
+my $finish       = $opt_F;
+my $checksum     = $opt_k;
+my $ids_ttl      = $opt_t;
+my $marker       = $opt_m;
+
+validate_flags();
+
+my $tcp_payload  = "ftestertcpprobe$marker";
+my $udp_payload  = "ftesterudpprobe$marker";
+my $icmp_payload = "ftestericmpprobe$marker";
+my $seqprobe     = "seqprobe$marker";
+my $stopsignal   = "ftesterstop$marker";
+my $ackme        = "ackme$marker";
+my $finme        = "finme$marker";
+
+my $ttl          = 200;
+my $id    	 = 0;
+my $count 	 = 0;
+my $null;
+
+my @src_addr; 
+our($src_addr, $src_port, $dst_addr, $dst_port, $tos);
+
+my @flags_table;
+my ($psh, $ack, $rst, $syn, $urg, $fin);
+
+open(OUT, ">>./ftest$marker.log") || die "cannot create log file";
+print OUT ("# ftest started on ".`date`);
+
+if ($opt_c) {    
+    my @fields = split (/:/, $opt_c);
+    die "not enough parameters" unless @fields >= 6;
+    chomp @fields;
+    
+    $src_addr = $fields[0]; $src_port = $fields[1];
+    $dst_addr = $fields[2]; $dst_port = $fields[3];
+    $tos      = $fields[6];
+   
+    if ($fields[5] =~ 'TCP') {
+        send_tcp($fields[4], $tcp_payload);
+        message_tcp($fields[4]) if $verbose;
+    }
+    if ($fields[5] =~ 'UDP') {
+        send_udp($udp_payload);
+        message_udp() if $verbose;
+    }
+    if ($fields[5] =~ 'ICMP') {
+        send_icmp(
+            $fields[4], $icmp_payload,
+	    $fields[6], $fields[7]
+        );
+        message_icmp($fields[6], $fields[7]) if $verbose;
+    }
+    print OUT ("# ftest stopped on ".`date`);
+}
+
+for ($count = 0; $count < 64; $count++) {
+    $flags_table[$count] = "$flags_table[$count]P" if $count & 8;
+    $flags_table[$count] = "$flags_table[$count]U" if $count & 32;
+    $flags_table[$count] = "$flags_table[$count]S" if $count & 2;
+    $flags_table[$count] = "$flags_table[$count]A" if $count & 16;
+    $flags_table[$count] = "$flags_table[$count]F" if $count & 1;
+    $flags_table[$count] = "$flags_table[$count]R" if $count & 4;
+}
+
+open(CONF, $opt_f) or die "Can't open $opt_f" unless $opt_c;
+while (<CONF>) {
+    if (/^flags:/) {
+	 if (/restore/) {
+       	    print("\nRestoring command-line flags => $_\n") if $verbose;
+	    $delay    = $opt_d || 0.01;
+	    $sleep    = $opt_s || 1;
+	    $fragment = $opt_g || 0;
+	    $segments = $opt_p || 0;
+	    $evasion  = $opt_e || 0;
+	    $reset    = $opt_r; $finish  = $opt_F;
+	    $checksum = $opt_k; $ids_ttl = $opt_t;
+	} else {    
+       	    print("\nOverriding command-line flags => $_\n") if $verbose;
+	    $delay    = $1 if /-d (\S+)/; $sleep    = $1 if /-s (\S+)/; 
+            $fragment = $1 if /-g (\S+)/; $segments = $1 if /-p (\S+)/;
+            $evasion  = $1 if /-e (\S+)/; $checksum = $1 if /-k (\S+)/;
+            $ids_ttl  = $1 if /-t (\S+)/; $reset    = 'ok' if /-r/;
+            $finish   = 'ok' if /-F/;     
+	}    
+        validate_flags();
+    }
+    next if /^#|^\s|^flags:/;
+    chomp;
+    my @fields = split /:/;
+    die "wrong configuration file syntax!" unless ( @fields >= 6 or $_ =~ /^insert/ );
+
+    $psh = 0; $ack = 0; $rst = 0; $syn = 0; $urg = 0; $fin = 0;
+
+    $psh = 1 if $fields[4] =~ /P/;
+    $ack = 1 if $fields[4] =~ /A/;
+    $rst = 1 if $fields[4] =~ /R/;
+    $syn = 1 if $fields[4] =~ /S/;
+    $urg = 1 if $fields[4] =~ /U/;
+    $fin = 1 if $fields[4] =~ /F/;
+
+    if ($_ !~ /^stop_signal|^connect|^ids|^insert/) { 
+	
+	if ($fields[0] =~ /\//) { 
+	    parse_cidr($fields[0]);
+	} else {
+	    parse_range($fields[0]);
+	}    
+        
+	foreach $src_addr (@src_addr) {        
+	    
+	    my @src_port_range = split (/-/, $fields[1]);
+            ($src_port_range[1] = $src_port_range[0]) if !($src_port_range[1]);
+            
+	    for $src_port ($src_port_range[0] .. $src_port_range[1]) {
+
+                my @dst_port_range = split (/-/, $fields[3]);
+                ($dst_port_range[1] = $dst_port_range[0]) if !($dst_port_range[1]);
+                            
+                for $dst_port ($dst_port_range[0] .. $dst_port_range[1]) {
+
+                    $dst_addr = $fields[2]; $tos = $fields[6];
+
+                    if ($fields[5] =~ 'TCP') {
+                        send_tcp($fields[4], $tcp_payload);
+                        message_tcp($fields[4]) if $verbose;
+                    }
+                    if ($fields[5] =~ 'UDP') {
+                        send_udp($udp_payload);
+                        message_udp() if $verbose;
+                    }
+                    if ($fields[5] =~ 'ICMP') {
+                        send_icmp(
+                            $fields[4],   $icmp_payload,
+                            $fields[6],   $fields[7]
+                        );
+                    message_icmp($fields[6], $fields[7]) if $verbose;
+                    }
+	        }
+            }
+        }
+    }
+
+    if ($fields[0] =~ /^connect/) { 
+        
+        die "only TCP can be specified in connection spoofing mode" unless $fields[5] =~ 'TCP';
+        die "connection spoofing is useless for SYN packets, use normal mode instead" unless $syn =~ 0;
+	            
+        my @connect_fields = split /=|:/;
+        chomp @connect_fields;
+
+	if ($fields[0] =~ /\//) { 
+	    parse_cidr($connect_fields[1]);
+	} else {
+	    parse_range($connect_fields[1]);
+	}    
+
+        foreach $src_addr (@src_addr) {        
+
+	    my @src_port_range = split (/-/, $fields[1]);
+	    ($src_port_range[1] = $src_port_range[0]) if !($src_port_range[1]);
+		
+            for $src_port ($src_port_range[0] .. $src_port_range[1]) {
+                                   
+	        my @dst_port_range = split (/-/, $fields[3]);
+	        ($dst_port_range[1] = $dst_port_range[0]) if !($dst_port_range[1]);
+				    
+	        for $dst_port ($dst_port_range[0] .. $dst_port_range[1]) {
+
+                    $dst_addr = $connect_fields[3];
+
+                    my $rand = int(rand(65535));
+                    my $l    = length $tcp_payload;
+		    
+		    send_tcp_connect(
+                        "S",  $seqprobe,
+		        $rand
+		    );
+                    print("Sent Syn Probe => ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ","S", " ","TCP","\n") if $verbose;
+
+                    print("Sleeping for $sleep seconds\n") if $verbose;
+                    sleep($sleep);
+
+                    send_tcp_connect(
+                         "A",     $null,
+                         $rand+8, $rand+1024+1
+                    );
+                    print("Sent Ack Reply => ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ","A"," ","TCP","\n") if $verbose;
+
+                    send_tcp(
+                         $connect_fields[5], $tcp_payload,
+		         $rand+8,            $rand+1024+1       
+                    );
+                    message_tcp($connect_fields[5]) if $verbose;
+		
+		    send_tcp(
+                         $connect_fields[5], $ackme,
+                         $rand+8+$l,         $rand+1024+1,       
+			 3
+		    );
+
+         	    if ($reset) {
+	                 send_rst( 
+                             'R',          $null,
+		             $rand+8+$l+5, $rand+1024+1
+                         );
+		    } 
+                
+		    if ($finish) {
+		        my $l = length $tcp_payload;
+                        my $finme   = "finme";
+	                send_fin( 
+                            'F',                $finme,
+            	            $connect_fields[7], $rand+8+$l+5,
+	    	            $rand+1024+1
+                        );
+                        sleep($sleep);
+                        send_ack(
+                            'A',            $null,
+		            $rand+8+$l+5+5, $rand+1024+2
+		        );	
+	            }
+	        }
+            }
+        } 
+    }
+
+    if ( $fields[0] =~ /^stop_signal/ ) { 
+        my @stop_fields = split /=|:/;
+        chomp @stop_fields;
+
+	$src_addr = $stop_fields[1];
+	$src_port = $stop_fields[2];
+	$dst_addr = $stop_fields[3];
+	$dst_port = $stop_fields[4];
+	$tos      = $stop_fields[7];
+
+        if ($stop_fields[6] =~ 'TCP') {
+            print("Stop packet => ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ",$stop_fields[5]," ","TCP","\n") if $verbose;
+            send_tcp($stop_fields[5], $stopsignal);
+        }
+        if ($stop_fields[6] =~ 'UDP') {
+            print("Stop packet => ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ","UDP","\n") if $verbose;
+            send_udp($stopsignal);
+        }
+        if ($stop_fields[6] =~ 'ICMP') {
+            print("Stop packet => ",$src_addr," > ",$dst_addr," ","ICMP"," ",$stop_fields[7]," ",$stop_fields[8],"\n") if $verbose;
+            send_icmp(
+                $stop_fields[5], $stopsignal,
+                $stop_fields[7], $stop_fields[8]
+            );
+        }
+    }
+
+    if ($fields[0] =~ /^ids/) { 
+
+        my @ids_fields = split (/=|:/, $_, 9);
+        chomp @ids_fields;
+
+        my $rand     = int(rand(65535));
+        my $wrongack = int(rand(65535));
+        my $l        = length $ids_fields[8];
+
+	if ($ids_fields[1] =~ /\//) { 
+	    parse_cidr($ids_fields[1]);
+	} else {
+	    parse_range($ids_fields[1]);
+	}    
+        
+        foreach $src_addr (@src_addr) {
+ 
+	    my @src_port_range = split (/-/, $ids_fields[2]);
+            ($src_port_range[1] = $src_port_range[0]) if !($src_port_range[1]);
+            
+	    for $src_port ($src_port_range[0] .. $src_port_range[1]) {
+
+                my @dst_port_range = split (/-/, $ids_fields[4]);
+                ($dst_port_range[1] = $dst_port_range[0]) if !($dst_port_range[1]);
+                            
+                for $dst_port ($dst_port_range[0] .. $dst_port_range[1]) {
+
+                    $dst_addr = $ids_fields[3]; 
+                    $tos      = $ids_fields[7];
+
+                    if ($evasion =~ 'desync2') {
+                        $checksum = 60000;
+                        send_tcp_connect(
+                            "S",       '',
+		            $wrongack, 2
+                        ) if ($syn eq 0);
+                        $checksum = $opt_k;
+                    }
+        
+	            if ($ids_fields[6] =~ 'TCP') {
+
+                        if (($ids_fields[0] =~ /ids-conn/) and ($syn eq 0)) {
+		            send_tcp_connect(
+	                        "S",            $seqprobe,
+	                        $rand
+                            );
+			    print("Sent Syn Probe => ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ","S"," ","TCP","\n") if $verbose;
+	                    print("Sleeping for $sleep seconds\n") if $verbose;
+                            sleep($sleep);
+
+                            send_tcp_connect(
+                                "A",     $null,
+	                        $rand+8, $rand+1024+1
+                            );
+	                    print("Sent Ack Reply => ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ","A"," ","TCP","\n") if $verbose;
+                        }
+
+                        if (!($evasion) or $evasion =~ /frag/) {
+	                    send_tcp(
+                                $ids_fields[5], $ids_fields[8],
+	                        $rand+8,        $rand+1024+1,   
+				1
+		            );
+                
+		            if (($ids_fields[0] =~ /ids-conn/) and ($syn eq 0)) {
+	                        send_tcp(
+                                    $ids_fields[5], $ackme,
+	                            $rand+8+$l,     $rand+1024+1,   
+				    3 
+                                );
+
+	                        if ($reset) {
+	                            send_rst( 
+                                        'R',          $null,
+            	                        $rand+8+$l+5, $rand+1024+1
+                                    );
+	                        }
+
+                                if ($finish) { 
+	                            send_fin( 
+                                        'F',          $finme,
+                                        $rand+8+$l+5, $rand+1024+1
+                                    );
+				    sleep($sleep);
+			            send_ack(
+                                        'A',            $null,
+	                                $rand+8+$l+5+5, $rand+1024+2
+	                            );	
+                                }
+                            }
+	                }
+			    
+	                if ($evasion and $evasion !~ /frag/) {
+
+	                    my $seg_number = $segments || 2;
+                            my $seq_off;
+	                    my $s;
+      
+	                    my $stream        = $ids_fields[8]; 
+                            my $stream_length = length $stream;
+                            my $bogus   = "dumbIDS";
+
+                            if ($segments =~ /(\d*)b$/) { 
+                                $s = $1;
+	                        while ($s > $stream_length) {
+                                    $s--;
+	                            print("resizing segments size to ",$s," bytes\n") if $verbose;
+	                        } 
+	                        $seg_number = ceil($stream_length/$s);
+	                    } else { $s = floor($stream_length/$seg_number); }
+
+                            while ($seg_number > $stream_length and ($seg_number != 1)) { 
+                                $seg_number--;
+	                        print("resizing fragments number to ",$seg_number,"\n") if $verbose;
+                            } 
+
+	                    for my $i (1 .. ($seg_number - 1)) {
+                        
+	                        $stream =~ s/(.{$s})(.*)/$2/g; 
+                                $seq_off = $seq_off + $s;
+
+                                if ($i == 1) {
+                                    $seq_off = 0;
+	                            send_tcp(
+                                        $ids_fields[5], $1,
+		                        $rand+8,        $rand+1024+1,   
+					1
+		                    );
+                                }
+
+                                send_tcp(
+                                    $ids_fields[5],   $1,
+		                    $rand+8+$seq_off, $rand+1024+1,   
+				    1
+		                ) if ($i != 1);
+	                    }
+               
+		            $seq_off = $seq_off + $s; 
+		            $seq_off = 0 if ($seg_number == 1); 
+                
+		            if ($evasion =~ 'stream1') {
+                                $checksum = 60000;
+                                send_tcp(
+                                    $ids_fields[5],   $bogus,
+			            $rand+8+$seq_off, $rand+1024+1,	
+				    2
+                                );
+                                $checksum = $opt_k;
+                            }
+                
+		            if ($evasion =~ 'ttl1') {
+                                $ttl = $ids_ttl;
+                                send_tcp(
+                                    $ids_fields[5],   $bogus,
+			            $rand+8+$seq_off, $rand+1024+1,	
+				    2
+                                );
+                                $ttl = 200;
+                            }
+                
+		            if ($evasion =~ 'rst1') {
+                                $checksum = 60000;
+                                send_rst( 
+                                    'R',              $bogus,
+			            $rand+8+$seq_off, $rand+1024+1,   
+				    2
+                                );
+                                $checksum = $opt_k;
+                            }
+                
+		            if ($evasion =~ 'rst2') {
+		                $ttl = $ids_ttl;
+		                send_rst(
+                                    'R',              $bogus,
+                                    $rand+8+$seq_off, $rand+1024+1,   
+				    2
+                                );
+                                $ttl = 200;
+                            }
+                
+		            if ($evasion =~ 'desync1') {
+                                send_tcp_connect(
+                                    "S",       '',
+			            $wrongack, 2
+                                );
+                            }
+                
+		            send_tcp(
+                                $ids_fields[5],   $stream,
+		                $rand+8+$seq_off, $rand+1024+1,   
+				1
+		            );
+		
+		            if (($ids_fields[0] =~ /ids-conn/) and ($syn eq 0)) {
+                                send_tcp(
+                                    $ids_fields[5], $ackme,
+		                    $rand+8+$l,     $rand+1024+1,   
+				    3 
+		                );
+			       
+                                if ($reset) {
+	                            send_rst( 
+                                        'R',          $null,
+	     	                        $rand+8+$l+5, $rand+1024+1
+                                    );
+		                }
+				
+		                if ($finish) { 
+	                            send_fin( 
+                                        'F',          $finme,
+            	                        $rand+8+$l+5, $rand+1024+1
+                                    );
+			            sleep($sleep);
+                                    send_ack(
+                                        'A',            $null,
+		                        $rand+8+$l+5+5, $rand+1024+2
+	                            );	
+		                }
+		            }
+	                }
+                        message_tcp_ids($ids_fields[5], $ids_fields[8]) if $verbose;
+		    }
+                        
+	            if ($ids_fields[6] =~ 'UDP') {
+                        send_udp($ids_fields[8], 1);
+                        message_udp_ids($ids_fields[8]) if $verbose;
+                    }
+                        
+	            if ($ids_fields[6] =~ 'ICMP') {
+                        my @ids_fields = split (/=|:/, $_, 10); # ICMP has 9 fields
+                        send_icmp(
+                            $ids_fields[5], $ids_fields[9],
+		            $ids_fields[7], $ids_fields[8],
+		            1
+                        );
+                        message_icmp_ids($ids_fields[7], $ids_fields[8], $ids_fields[9]) if $verbose;
+                    }
+                }
+            }
+        }
+    }
+                    
+    if ($fields[0] =~ /^insert/) {    
+        
+        my @insert_fields = split;
+	my ($protocol, $flag_field, $content, $msg, $dehex, $dsize, $mm, $offset);
+        my ($itype, $icode);
+
+        $src_addr = $insert_fields[2];
+        $dst_addr = $insert_fields[3];
+        $tos      = $insert_fields[4];
+        
+        open(SNORT, $insert_fields[1]) or die "Can't open $insert_fields[1]";
+                            
+        while (<SNORT>) {
+            if (/\S+\s+(\S+)\s+\S+\s(\S+)\s+-\>\s+\S+\s+(\S+)\s+\(([^\)]+)\)/) {
+				   
+                my $rand     = int(rand(65535));
+                my $wrongack = int(rand(65535));
+                            
+                $protocol = $1;
+                $src_port = $2;
+                $dst_port = $3;
+
+                if ( $src_port =~ /any/ ) {
+                    $src_port = int(rand(65535));
+                }
+                if ( $dst_port =~ /any/ ) {
+                    $dst_port = int(rand(65535));
+                }
+
+                $msg        = 0; $content    = 0;
+                $flag_field = 0; $dsize      = 0;
+                $offset     = 0; $itype      = 0;
+                $icode      = 0;
+
+                next if (/^#/);
+                                    
+                next if (!(/msg:\s*"([^"]+)";/));
+                $msg = $1;
+                                    
+	        next if (!(/content:\s*"([^"]+)";/));
+                $content = $1;
+                                    
+	        if (/flags:\s*([^;]+);/)       { $flag_field = $1; }
+                if (/dsize:\s*([><]*)([^;]+)/) { $dsize = $2; $mm = $1; }
+                if (/offset:\s*(\d+)\s*;/)     { $offset = $1; }
+                if (/itype:\s*(\d+);/)         { $itype  = $1; }
+                if (/icode:\s*(\d+);/)         { $icode  = $1; }
+
+                my $pad = 'A' x $offset;
+
+                $psh = 0; $ack = 0; $rst = 0; $syn = 0; $urg = 0; $fin = 0;
+
+                $psh = 1 if $flag_field =~ /P/;
+                #$psh = 1 if $flag_field =~ /+/; fixme
+                $ack = 1 if $flag_field =~ /A/;
+                $rst = 1 if $flag_field =~ /R/;
+                $syn = 1 if $flag_field =~ /S/;
+                $urg = 1 if $flag_field =~ /U/;
+                $fin = 1 if $flag_field =~ /F/;
+
+                if ($content =~ /\|([^\|]+)\|/) {
+                    $dehex   = $1;
+                    $dehex   =~ s/([0-9a-fA-F]{2})/pack('c',hex($1))/eg;
+                    $dehex   =~ s/ //g;
+                    $content =~ s/\|[^\|]+\|/$dehex/g;
+                }
+
+                $content = $pad . $content;
+
+                if ($dsize) {
+                    my $length = length($content);
+                    my $need   = $dsize - $length;
+                    if ( $mm eq ">" ) {
+                        $need++;
+                    }
+                    elsif ( $mm eq "<" ) {
+                        $need--;
+                    }
+                    my $padd = 'A' x $need;
+                    $content = $content . $padd;
+                }
+
+
+                if ($evasion =~ 'desync2') {
+                    $checksum = 60000;
+                    send_tcp_connect(
+                        "S",       '',
+		        $wrongack, 2
+                    ) if ($syn eq 0);
+                    $checksum = $opt_k;
+                }
+                
+		if ($protocol =~ /tcp|TCP/) {
+		                        
+                    my $l = length $content; 
+                
+                    if (($insert_fields[0] =~ /insert-conn/) and ($syn eq 0)) {
+                        send_tcp_connect(
+                            "S",               $seqprobe,
+                            $rand
+                        );
+			print("Sent Syn Probe => ", $src_addr, ":", $src_port, " > ", $dst_addr, ":", $dst_port, " ", "S", " ", "TCP", "\n") if $verbose;
+                        
+			print("Sleeping for $sleep seconds\n") if $verbose;
+			sleep($sleep);
+
+                        send_tcp_connect(
+                            "A",     $null,
+                            $rand+8, $rand+1024+1
+                        );
+                        print("Sent Ack Reply => ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ","A"," ","TCP","\n") if $verbose;
+	            }	
+		
+		    if (!($evasion) or $evasion =~ /frag/) {
+		        send_tcp(
+                            $flag_field, $content,
+		            $rand+8,     $rand+1024+1,      
+			    1
+		        );
+
+                        send_tcp(
+                            $flag_field, $ackme,
+		            $rand+8+$l,  $rand+1024+1,      
+			    3
+                        ) if ($syn eq 0);
+
+                        if (($insert_fields[0] =~ /insert-conn/) and ($syn eq 0)) {
+	            
+		            if ($reset) {
+	                        send_rst( 
+                                    'R',          $null,
+	                            $rand+8+$l+5, $rand+1024+1
+                                );
+       	                    }
+ 
+	                    if ($finish) {
+	                        send_fin( 
+                                    'F',          $finme,
+	                            $rand+8+$l+5, $rand+1024+1
+                                );
+       	                        sleep($sleep);
+		                send_ack( 
+                                    'A',            $null,
+	                            $rand+8+$l+5+5, $rand+1024+2
+                                );
+	                    }
+		        }
+                    }
+		
+                    if ($evasion and $evasion !~ /frag/) {
+                        
+	                my $seg_number = $segments || 2;
+                        my $seq_off;
+	                my $s;
+      
+	                my $stream        = $content;
+                        my $stream_length = length $stream;
+                        my $bogus   = "dumbIDS";
+
+                        if ($segments =~ /(\d*)b$/) { 
+                            $s = $1;
+	                    while ($s > $stream_length) {
+                                $s--;
+	                        print("resizing segments size to ",$s," bytes\n") if $verbose;
+	                    } 
+	                    $seg_number = ceil($stream_length/$s);
+	                } else { $s = floor($stream_length/$seg_number); }
+
+                        while ($seg_number > $stream_length and ($seg_number != 1)) { 
+                            $seg_number--;
+	                    print("resizing fragments number to ",$seg_number,"\n") if $verbose;
+                        }
+
+ 	                for my $i (1 .. ($seg_number - 1)) {
+                         
+	                    $stream =~ s/(.{$s})(.*)/$2/g; 
+                            $seq_off = $seq_off + $s;
+
+                            if ($i == 1) {
+                                $seq_off = 0;
+                                send_tcp(
+                                    $flag_field, $1,
+                                    $rand+8,     $rand+1024+1,      
+				    1
+    		                );
+                            }
+                                
+		 	    send_tcp(
+                                $flag_field,      $1,
+                                $rand+8+$seq_off, $rand+1024+1,      
+				1
+    		            ) if ($i != 1);
+                        } 
+		        
+		        $seq_off = $seq_off + $s; 
+		        $seq_off = 0 if ($seg_number == 1); 
+
+                        if ($evasion =~ 'stream1') {
+                            $checksum = 60000;
+                            send_tcp(
+                                $flag_field,      $bogus,
+                                $rand+8+$seq_off, $rand+1024+1,      
+				2
+                            );
+                            $checksum = $opt_k;
+                        }
+                    
+		        if ($evasion =~ 'ttl1') {
+                            $ttl = $ids_ttl;
+                            send_tcp(
+                                $flag_field,      $bogus,
+			        $rand+8+$seq_off, $rand+1024+1,      
+				2
+                            );
+                            $ttl = 200;
+                        }
+                    
+		        if ($evasion =~ 'rst1') {
+                            $checksum = 60000;
+                            send_rst(
+                                'R',              $bogus,
+			        $rand+8+$seq_off, $rand+1024+1,      
+				2
+                            );
+                            $checksum = $opt_k;
+                        }
+                    
+		        if ($evasion =~ 'rst2') {
+                            $ttl = $ids_ttl;
+                            send_rst(
+                                'R',              $bogus,
+			        $rand+8+$seq_off, $rand+1024+1,      
+				2
+                            );
+                            $ttl = 200;
+                        }
+                    
+		        if ($evasion =~ 'desync1') {
+                            send_tcp_connect(
+                                "S",       '',
+		                $wrongack, 2
+                            );
+                        }
+
+                        send_tcp(
+                            $flag_field,      $stream,
+			    $rand+8+$seq_off, $rand+1024+1,      
+			    1
+		        );
+					 
+                        if (($insert_fields[0] =~ /insert-conn/) and ($syn eq 0)) {
+                    
+		            send_tcp(
+                                $flag_field, $ackme,
+			        $rand+8+$l,  $rand+1024+1,      
+				3     
+                            );
+
+	                    if ($reset) {
+	                        send_rst( 
+                                    'R',          $null,
+	                            $rand+8+$l+5, $rand+1024+1
+                                );
+                            }
+					     
+		            if ($finish) {
+                                send_fin( 
+                                    'F',          $finme,
+ 	                            $rand+8+$l+5, $rand+1024+1
+                                );
+                                sleep($sleep);
+		                send_fin( 
+                                    'F',            $null,
+      	                            $rand+8+$l+5+5, $rand+1024+2
+                                );
+		            }
+		        }
+		    }
+
+                    message_tcp_ids($flag_field, $msg) if $verbose;
+
+                }
+                                    
+                if ($protocol =~ /udp|UDP/) {
+                    send_udp($content, 1) if !($evasion or $evasion =~ /frag/);
+		    message_udp_ids($msg) if $verbose;
+                }
+                                    
+                if ($protocol =~ /icmp|ICMP/) {
+                    send_icmp(
+                        $flag_field,       $content,
+                        $itype,            $icode,
+                        1
+                    ) if !($evasion);
+                    
+		    message_icmp_ids($itype, $icode, $msg) if $verbose;
+                }
+            }
+        }
+    } 
+}
+
+print OUT ("# ftest stopped on ".`date`);
+close(CONF);
+
+sub validate_flags {
+
+    die "you cannot use -r and -F flags together! (see man page)" if ($reset & $finish);
+    die "the -p flag without an evasion option is useless!"       if ($segments and !($evasion));
+    die "you have to specify at least two fragments (-g 2)!"      if ($fragment and ($fragment !~ /b/) and $fragment < 2);
+    die "you cannot specify null fragment size!"                  if ($fragment and ($fragment eq '0b'));
+    die "you cannot specify null segment size!"                   if ($segments and ($segments eq '0b'));
+
+}
+
+sub parse_range {
+  
+    undef @src_addr;
+   
+    my @ip_range = split (/\.|-/, $_[0]);
+    ($ip_range[4] = $ip_range[3]) if !($ip_range[4]); 
+
+    for my $i ($ip_range[3] .. $ip_range[4]) {
+         my $address = "$ip_range[0].$ip_range[1].$ip_range[2].$i";
+	 push (@src_addr, $address);
+    }	
+
+}    
+
+sub parse_cidr {
+    
+    undef @src_addr;
+    
+    my @address = split (/\//, $_[0]);
+    my @ip = split (/\./, $address[0]);
+
+    my $mask = $address[1];
+    my $host_num = 2**(32-$mask); 
+    my $class_num = $host_num/256;
+
+    die "CIDR base address didn't start at subnet boundary" 
+        if (($mask < 32) and ($ip[3] != 0) and ((($ip[3]/$class_num)/256) !~ /^\d+$/));
+
+    die "CIDR base address didn't start at subnet boundary" 
+        if (($mask < 24) and ($ip[2] != 0) and (($ip[2]/$class_num) !~ /^\d+$/));
+
+    die "CIDR base address didn't start at subnet boundary" 
+        if (($mask < 16) and ($ip[1] != 0) and ((($ip[1]*256)/$class_num) !~ /^\d+$/));
+
+    die "CIDR base address didn't start at subnet boundary" 
+        if (($mask < 8) and ($ip[0] != 0) and ((($ip[0]*256)/$class_num) !~ /^\d+$/));
+
+    for my $i (1 .. $host_num) {
+        if (($ip[3] != 0) and ($ip[3] != 255)) {
+	    my $address = "$ip[0].$ip[1].$ip[2].$ip[3]";
+	    push (@src_addr, $address);
+	}    
+        $ip[3]++;
+        ($ip[2] = ($ip[2]+1) and ($ip[3] = 0)) if ($ip[3] == 256);
+        ($ip[1] = ($ip[1]+1) and ($ip[2] = 0)) if ($ip[2] == 256);
+        ($ip[0] = ($ip[0]+1) and ($ip[1] = 0)) if ($ip[1] == 256);
+    }
+
+}
+
+sub message_tcp {
+    print($id," - ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ",$_[0]," ","TCP"," ",$tos,"\n");
+}    
+
+sub message_udp {
+    print($id," - ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ","UDP"," ",$tos,"\n");
+}    
+
+sub message_icmp {
+    print($id," - ",$src_addr," > ",$dst_addr," ","ICMP"," ",$_[0]," ",$_[1],"\n");
+}    
+
+sub message_tcp_ids {
+    print($id," - ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ",$_[0]," ","TCP"," ",$tos," \"",$_[1],"\"","\n");
+}    
+
+sub message_udp_ids {
+    print($id," - ",$src_addr,":",$src_port," > ",$dst_addr,":",$dst_port," ","UDP"," ",$tos," \"",$_[0],"\"","\n");
+}    
+
+sub message_icmp_ids {
+    print($id," - ",$src_addr," > ",$dst_addr," ","ICMP"," ",$_[0]," ",$_[1]," \"",$_[2],"\"","\n");
+}    
+
+# packet injection subs
+#
+#  send_tcp(
+#      flags,               payload,
+#      seq number,          ack number,          
+#      logging method (null > ftest.log, 1 > ftest.log [IDS mode], 2 > evasion packet, 3 > none)
+#  );
+#
+#  send_udp(payload, logging method);
+#
+
+sub send_tcp {
+
+    $id++; if ($id > 65535) { $id = 0 };
+
+    $a = new Net::RawIP(
+        {
+            ip => {
+		ttl     => $ttl,
+                id      => $id,
+                saddr   => $src_addr,
+                daddr   => $dst_addr,
+                tos     => $tos
+	    },
+            tcp => {
+                check   => $checksum,
+                source  => $src_port,
+                dest    => $dst_port,
+                psh     => $psh,
+                ack     => $ack,
+                rst     => $rst,
+                syn     => $syn,
+                urg     => $urg,
+                fin     => $fin,
+                seq     => $_[2],
+                ack_seq => $_[3],
+                data    => $_[1]
+            }
+        }
+    );
+    $a->send($delay, 1) if (!($fragment) or $_[1] =~ /ackme/ or ((length $_[1]) <= 4));
+   
+    if ($fragment and $_[1] !~ /ackme/ and ((length $_[1]) > 4)) {
+        
+	my $frag = $fragment;
+	my @fragments;
+	my $offset;
+        my $b = 8;
+      	
+	my $packet = $a->packet;
+	$packet    = NetPacket::TCP->decode(ip_strip($packet));
+	my $cksum  = $packet->{cksum} if !($checksum);
+        
+	my $frag1_data = $_[1]; 
+        my $frag2_data = $_[1]; 
+
+        $frag1_data =~ s/(.{4}).*/$1/g;
+        
+	$a = new Net::RawIP(
+            {
+                ip => {
+		    frag_off => 0x2000,
+		    protocol => 0x06,
+		    ttl      => $ttl,
+                    id       => $id,
+                    saddr    => $src_addr,
+                    daddr    => $dst_addr,
+                    tos      => $tos
+	        },
+                tcp => {
+                    check    => $cksum,
+                    source   => $src_port,
+                    dest     => $dst_port,
+                    psh      => $psh,
+                    ack      => $ack,
+                    rst      => $rst,
+                    syn      => $syn,
+                    urg      => $urg,
+                    fin      => $fin,
+                    seq      => $_[2],
+                    ack_seq  => $_[3],
+                    data     => $frag1_data
+                }
+            }
+        );
+        push (@fragments, $a);
+
+        $frag2_data =~ s/.{4}(.*)/$1/g;
+
+        if ($fragment =~ /(\d*)b$/) { 
+            $b = $1;
+            die "fragments size must be a multiple of 8" if (($1/8) =~ /\./);
+	    while ($b > length($frag2_data) and (length($frag2_data) >= 8)) {
+                $b = $b - 8;
+	        print("resizing fragments size to ",$b," bytes\n") if $verbose;
+	    } 
+	    $frag = ceil(1 + ((length $frag2_data)/$b));
+	}
+
+	my $frag_number = ($frag - 1);
+	my $n = ceil((length $frag2_data)/$b);  
+
+        while ($frag_number > $n and ($frag_number != 1)) { 
+            $frag_number--;
+	    print("resizing fragments number to ",$frag_number+1,"\n") if $verbose;
+        }
+        
+	for my $i (1 .. ($frag_number - 1)) {
+    
+        $frag2_data =~ s/(.{$b})(.*)/$2/g; 
+
+	    $offset = hex(2003)             if ($i == 1); 
+	    $offset = ($offset + hex($b/8)) if ($i != 1);
+	   
+	    $a = new Net::RawIP(
+                {
+                    ip => {
+		        frag_off => $offset,
+		        protocol => 0x06,
+		        ttl      => $ttl,
+                        id       => $id,
+                        saddr    => $src_addr,
+                        daddr    => $dst_addr,
+                        tos      => $tos
+	            },
+                    generic => {
+                        data     => $1
+                    }
+                }
+            );
+            push (@fragments, $a);
+	}
+
+        $offset  = $offset - hex(2000) + hex($b/8); 
+        $offset  = hex(0003) if ($frag_number == 1); 
+
+	$a = new Net::RawIP(
+            {
+                ip => {
+                    frag_off => $offset, 
+		    protocol => 0x06,
+		    ttl      => $ttl,
+                    id       => $id,
+                    saddr    => $src_addr,
+                    daddr    => $dst_addr,
+                    tos      => $tos
+	        },
+                generic => {
+                    data     => $frag2_data
+                }
+            }
+        );
+	push (@fragments, $a);
+   
+        if ($evasion !~ /frag/) {
+	    $fragments[0]->send($delay,1); 
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$i]->send($delay,1); 
+            }
+	    $fragments[$frag_number]->send($delay,1);
+        }
+    
+        if ($evasion =~ /frag1/) {
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$frag_number-$i]->send($delay,1); 
+            }
+	    $fragments[0]->send($delay,1); 
+	    $fragments[$frag_number]->send($delay,1);
+        }
+  
+        if ($evasion =~ /frag2/) {
+	    $fragments[$frag_number]->send($delay,1);
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$frag_number-$i]->send($delay,1); 
+            }
+	    $fragments[0]->send($delay,1); 
+        }
+   
+        if ($evasion =~ /frag3/) {
+	    $fragments[0]->send($delay,1); 
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$i]->send($delay,1); 
+                $fragments[$i]->send($delay,1) if ($i == ($frag_number - 1)); 
+            }
+	    $fragments[$frag_number]->send($delay,1);
+        }
+   
+        if ($evasion =~ /frag4/) { 
+	    $fragments[0]->send($delay,1); 
+	     
+	    $a = new Net::RawIP(
+                {
+                    ip => {
+		        frag_off => 0x2000,
+		        protocol => 0x06,
+		        ttl      => $ttl,
+                        id       => $id,
+                        saddr    => $src_addr,
+                        daddr    => $dst_addr,
+                        tos      => $tos
+	            },
+                    tcp => {
+                        check    => $cksum,
+                        source   => $src_port,
+                        dest     => $dst_port,
+                        psh      => $psh,
+                        ack      => $ack,
+                        rst      => $rst,
+                        syn      => $syn,
+                        urg      => $urg,
+                        fin      => $fin,
+                        seq      => $_[2],
+                        ack_seq  => $_[3],
+                        data     => 'over'
+                    }
+                }
+            );
+	    $a->send($delay,1);
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$i]->send($delay,1); 
+            }
+            $fragments[$frag_number]->send($delay,1);
+        }
+     
+        if ($evasion =~ /frag5/) { 
+	     
+	    $a = new Net::RawIP(
+                {
+                    ip => {
+		        frag_off => 0x2000,
+		        protocol => 0x06,
+		        ttl      => $ttl,
+                        id       => $id,
+                        saddr    => $src_addr,
+                        daddr    => $dst_addr,
+                        tos      => $tos
+	            },
+                    tcp => {
+                        check    => $cksum,
+                        source   => $src_port,
+                        dest     => $dst_port,
+                        psh      => $psh,
+                        ack      => $ack,
+                        rst      => $rst,
+                        syn      => $syn,
+                        urg      => $urg,
+                        fin      => $fin,
+                        seq      => $_[2],
+                        ack_seq  => $_[3],
+                        data     => 'over'
+                    }
+                }
+            );
+	    $a->send($delay,1);
+            $fragments[0]->send($delay,1); 
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$i]->send($delay,1); 
+            }
+            $fragments[$frag_number]->send($delay,1);
+	}
+    } 
+    
+    print OUT ("$id - $src_addr:$src_port > $dst_addr:$dst_port ")                       if (!$_[4]);
+    print OUT ("IDS mode >> $id - $src_addr:$src_port > $dst_addr:$dst_port \"$_[1]\" ") if ($_[4] == 1);
+    print OUT ("IDS mode >> $id - $src_addr:$src_port > $dst_addr:$dst_port \"$_[1]\" ") if ($_[4] == 2);
+    
+    my $flags = 0;
+
+    if ( $_[0] =~ /P/ ) {
+        $flags = 8;
+    }
+    if ( $_[0] =~ /A/ ) {
+        $flags = $flags + 16;
+    }
+    if ( $_[0] =~ /R/ ) {
+        $flags = $flags + 4;
+    }
+    if ( $_[0] =~ /S/ ) {
+        $flags = $flags + 2;
+    }
+    if ( $_[0] =~ /U/ ) {
+        $flags = $flags + 32;
+    }
+    if ( $_[0] =~ /F/ ) {
+        $flags = $flags + 1;
+    }
+    print OUT ("$flags_table[$flags] TCP $tos\n") if (($_[4] != 2) and ($_[4] != 3));
+    print OUT ("$flags_table[$flags] TCP $tos EVASION PACKET!\n") if ($_[4] == 2);
+}
+
+sub send_tcp_connect {
+
+    $id++; if ($id > 65535) { $id = 0 };
+
+    my ($sync, $ackc);
+
+    if ( $_[0] =~ /S/ ) {
+        $sync = 1;
+    }
+    if ( $_[0] =~ /A/ ) {
+        $ackc = 1;
+    }
+
+    $a = new Net::RawIP(
+        {
+            ip => {
+                ttl     => $ttl,
+                id      => $id,
+                saddr   => $src_addr,
+                daddr   => $dst_addr,
+                tos     => $tos
+            },
+            tcp => {
+                check   => $checksum,
+                source  => $src_port,
+                dest    => $dst_port,
+                ack     => $ackc,
+                syn     => $sync,
+                seq     => $_[2],
+                ack_seq => $_[3],
+                data    => $_[1]
+            }
+        }
+    );
+    $a->send($delay, 1);
+    print OUT ("IDS mode >> $id - $src_addr:$src_port > $dst_addr:$dst_port \"$_[1]\" ") if ($_[3] == 2);
+    print OUT ("S TCP $tos EVASION PACKET!\n")                                           if ($_[3] == 2);
+}
+
+sub send_rst {
+
+    $id++; if ($id > 65535) { $id = 0 };
+
+    $a = new Net::RawIP(
+        {
+            ip => {
+                ttl   	=> $ttl,
+                id    	=> $id,
+                saddr 	=> $src_addr,
+                daddr 	=> $dst_addr,
+                tos   	=> $tos
+            },
+            tcp => {
+                check   => $checksum,
+                source  => $src_port,
+                dest    => $dst_port,
+                rst     => '1',
+                ack     => '1',
+                seq     => $_[2],
+                ack_seq => $_[3]
+            }
+        }
+    );
+    $a->send($delay, 1);
+    print OUT ("IDS mode >> $id - $src_addr:$src_port > $dst_addr:$dst_port ") if ($_[4] == 2);
+    print OUT ("R TCP $tos EVASION PACKET!\n")                                 if ($_[4] == 2);
+}
+
+sub send_fin {
+
+    $id++; if ($id > 65535) { $id = 0 };
+
+    $a = new Net::RawIP(
+        {
+            ip => {
+                ttl   	=> $ttl,
+                id    	=> $id,
+                saddr 	=> $src_addr,
+                daddr 	=> $dst_addr,
+                tos   	=> $tos
+            },
+            tcp => {
+                check   => $checksum,
+                source  => $src_port,
+                dest    => $dst_port,
+                fin     => '1',
+                ack     => '1',
+                seq     => $_[2],
+                ack_seq => $_[3],
+                data    => $_[1]
+            }
+        }
+    );
+    $a->send($delay, 1);
+    print OUT ("IDS mode >> $id - $src_addr:$src_port > $dst_addr:$dst_port ") if ($_[4] == 2);
+    print OUT ("F TCP $tos EVASION PACKET!\n")                                 if ($_[4] == 2);
+}
+
+sub send_ack {
+
+    $id++; if ($id > 65535) { $id = 0 };
+
+    $a = new Net::RawIP(
+        {
+            ip => {
+                ttl   	=> $ttl,
+                id    	=> $id,
+                saddr 	=> $src_addr,
+                daddr 	=> $dst_addr,
+                tos   	=> $tos
+            },
+            tcp => {
+                check   => $checksum,
+                source  => $src_port,
+                dest    => $dst_port,
+                ack     => '1',
+                seq     => $_[2],
+                ack_seq => $_[3],
+                data    => $_[1]
+            }
+        }
+    );
+    $a->send($delay, 1);
+    print OUT ("IDS mode >> $id - $src_addr:$src_port > $dst_addr:$dst_port ") if ($_[4] == 2);
+    print OUT ("F TCP $tos EVASION PACKET!\n")                                 if ($_[4] == 2);
+}
+
+sub send_udp {
+
+    $id++; if ($id > 65535) { $id = 0 };
+
+    $a = new Net::RawIP(
+        {
+            ip => {
+		ttl   	=> $ttl,
+                id    	=> $id,
+                saddr 	=> $src_addr,
+                daddr 	=> $dst_addr,
+                tos   	=> $tos
+            },
+            udp => {
+                check  	=> $checksum,
+                source 	=> $src_port,
+                dest   	=> $dst_port,
+                data   	=> $_[0]
+            }
+        }
+    );
+    $a->send($delay, 1) if (!($fragment) or ((length $_[0]) <= 8));
+   
+    if ($fragment and ((length $_[0]) > 8)) {
+        
+	my $frag = $fragment;
+	my @fragments;
+	my $offset;
+        my $b = 8;
+	
+	my $packet = $a->packet;
+	$packet    = NetPacket::UDP->decode(ip_strip($packet));
+	my $cksum  = $packet->{cksum} if !($checksum);
+        
+	my $frag1_data = $_[0]; 
+        my $frag2_data = $_[0]; 
+
+        my $udp_len = 8 + (length $_[0]);
+
+        $frag1_data =~ s/(.{8}).*/$1/g;
+
+        $a = new Net::RawIP(
+            {
+                ip => {
+		    frag_off => 0x2000,
+		    protocol => 0x11,
+		    ttl      => $ttl,
+                    id       => $id,
+                    saddr    => $src_addr,
+                    daddr    => $dst_addr,
+                    tos      => $tos
+	        },
+                udp => {
+                    len      => $udp_len,
+		    check    => $cksum,
+                    source   => $src_port,
+                    dest     => $dst_port,
+                    data     => $frag1_data
+                }
+            }
+        );
+        push (@fragments, $a);
+
+        $frag2_data =~ s/.{8}(.*)/$1/g; 
+
+        if ($fragment =~ /(\d*)b$/) { 
+            $b = $1;
+            die "fragments size must be a multiple of 8" if (($1/8) =~ /\./);
+	    while ($b > length($frag2_data) and (length($frag2_data) >= 8)) {
+                $b = $b - 8;
+	        print("resizing fragments size to ",$b," bytes\n") if $verbose;
+	    }
+	    $frag = ceil(1 + ((length $frag2_data)/$b));
+	}
+	
+        my $frag_number = ($frag - 1);
+	my $n = ceil((length $frag2_data)/$b); 
+
+        while ($frag_number > $n and ($frag_number != 1)) { 
+            $frag_number--;
+	    print("resizing fragments number to ",$frag_number+1,"\n") if $verbose;
+        }
+        
+	for my $i (1 .. ($frag_number - 1)) {
+    
+            $frag2_data =~ s/(.{$b})(.*)/$2/g; 
+
+	    $offset = hex(2002)             if ($i == 1);
+	    $offset = ($offset + hex($b/8)) if ($i != 1);
+	
+	    $a = new Net::RawIP(
+                {
+                    ip => {
+		        frag_off => $offset,
+		        protocol => 0x11,
+		        ttl      => $ttl,
+                        id       => $id,
+                        saddr    => $src_addr,
+                        daddr    => $dst_addr,
+                        tos      => $tos
+	            },
+                    generic => {
+                        data     => $1
+                    }
+                }
+            );
+            push (@fragments, $a);
+        }
+
+        $offset  = $offset - hex(2000) + hex($b/8); 
+        $offset  = hex(0002) if ($frag_number == 1); 
+   
+        $a = new Net::RawIP(
+            {
+                ip => {
+                    frag_off => $offset,
+	            protocol => 0x11,
+	            ttl      => $ttl,
+                    id       => $id,
+                    saddr    => $src_addr,
+                    daddr    => $dst_addr,
+                    tos      => $tos
+	        },
+                generic => {
+                    data     => $frag2_data
+                }
+            }
+        );
+        push (@fragments, $a);
+
+	if ($evasion !~ /frag/) {
+            $fragments[0]->send($delay,1); 
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$i]->send($delay,1); 
+            }
+	    $fragments[$frag_number]->send($delay,1);
+        } 
+     
+	if ($evasion =~ /frag1/) {
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$frag_number-$i]->send($delay,1); 
+            }
+            $fragments[0]->send($delay,1); 
+	    $fragments[$frag_number]->send($delay,1);
+        } 
+     
+	if ($evasion =~ /frag2/) {
+	    $fragments[$frag_number]->send($delay,1);
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$frag_number-$i]->send($delay,1); 
+            }
+            $fragments[0]->send($delay,1); 
+        } 
+
+	if ($evasion =~ /frag3/) {
+            $fragments[0]->send($delay,1); 
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$i]->send($delay,1); 
+                $fragments[$i]->send($delay,1) if ($i == ($frag_number - 1)); 
+            }
+	    $fragments[$frag_number]->send($delay,1);
+        } 
+     
+        if ($evasion =~ /frag4/) { 
+	    $fragments[0]->send($delay,1); 
+	     
+	    $a = new Net::RawIP(
+                {
+                    ip => {
+		        frag_off => 0x2000,
+		        protocol => 0x11,
+		        ttl      => $ttl,
+                        id       => $id,
+                        saddr    => $src_addr,
+                        daddr    => $dst_addr,
+                        tos      => $tos
+	            },
+                    udp => {
+                        len      => $udp_len,
+                        check    => $cksum,
+                        source   => $src_port,
+                        dest     => $dst_port,
+                        data     => 'overlap!'
+                    }
+                }
+            );
+	    $a->send($delay,1);
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$i]->send($delay,1); 
+            }
+            $fragments[$frag_number]->send($delay,1);
+        }
+     
+        if ($evasion =~ /frag5/) { 
+	     
+	    $a = new Net::RawIP(
+                {
+                    ip => {
+		        frag_off => 0x2000,
+		        protocol => 0x11,
+		        ttl      => $ttl,
+                        id       => $id,
+                        saddr    => $src_addr,
+                        daddr    => $dst_addr,
+                        tos      => $tos
+	            },
+                    udp => {
+                        len      => $udp_len,
+                        check    => $cksum,
+                        source   => $src_port,
+                        dest     => $dst_port,
+                        data     => 'overlap!'
+                    }
+                }
+            );
+	    $a->send($delay,1);
+            $fragments[0]->send($delay,1); 
+	    for my $i (1 .. ($frag_number - 1)) {
+                $fragments[$i]->send($delay,1); 
+            }
+            $fragments[$frag_number]->send($delay,1);
+	}
+    }
+    
+    print OUT ("$id - $src_addr:$src_port > $dst_addr:$dst_port UDP $tos\n")                        if !($_[1]);
+    print OUT ("IDS mode >> $id - $src_addr:$src_port > $dst_addr:$dst_port UDP $tos \"$_[0]\" \n") if ($_[1]);
+}
+
+sub send_icmp {
+    
+    $id++; if ($id > 65535) { $id = 0 };
+
+    $a = new Net::RawIP(
+        {
+            ip => {
+                ttl   	=> $ttl,
+                id    	=> $id,
+                saddr 	=> $src_addr,
+                daddr 	=> $dst_addr
+            },
+            icmp => {
+                check 	=> $checksum,
+                type  	=> $_[2],
+                code  	=> $_[3],
+                data  	=> $_[1]
+            }
+        }
+    );
+    $a->send($delay, 1);
+
+    print OUT ("$id - $src_addr > $dst_addr ICMP $_[2] $_[3]\n")                        if !($_[4]);
+    print OUT ("IDS mode >> $id - $src_addr > $dst_addr ICMP $_[2] $_[3] \"$_[1]\" \n") if ($_[4]);
+}

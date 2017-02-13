@@ -1,0 +1,16 @@
+
+Thanks goes to:
+
+Chris Green <cmg@sourcefire.com> for his help on the ids connection spoofing
+testing on snort stream4 preprocessor.
+
+Fyodor <fygrave@tigerteam.net>, Don Bailey <baileydl@mitre.org> and Brian Caswell
+<bmc@mitre.org>. (I've taken some ideas from their snort false-positive generators)
+
+Pete Herzog <pete@ideahamster.org>
+
+Matthew Henninges, Rob J Meijer and Burak DAYIOGLU for their feedback (v0.3)
+
+Stephane Grundschober <Stephane.Grundschober@swisscom.com> (v0.2)
+
+Egidio, Gabriel and Vlad (v0.1)

@@ -1,0 +1,597 @@
+.\" SH section heading
+.\" SS subsection heading
+.\" LP paragraph
+.\" IP indented paragraph
+.\" TP hanging label
+.TH "FTester" 8 "13 Feb 2006" "version 1.0"
+.SH NAME
+FTester - Firewall and IDS testing tool
+.SH SYNOPSIS
+.B ftest 
+.B [ -c 
+.I sourceip:sourceport:destip:destport:flags:protocol:tos 
+.B ]
+.B [ -e
+.I evasion_method
+.B ]
+.B [ -d 
+.I delay 
+.B ]
+.B [ -f
+.I file 
+.B ]
+.B [ -F ]
+.B [ -g 
+.I fragments_number|fragments_size
+.B ]
+.B [ -k 
+.I cksum
+.B ] 
+.B [ -p 
+.I segments_number|segments_size
+.B ]
+.B [ -r ]
+.B [ -s 
+.I time 
+.B ]
+.B [ -t
+.I ttl
+.B ]
+.B [ -m
+.I marker
+.B ]
+.B [ -v ] 
+
+.B ftestd
+.B [ -c 
+.I ttl1:ttl2
+.B ]
+.B [ -g ]
+.B [ -i
+.I interface
+.B ]
+.B [ -m
+.I marker
+.B ]
+.B [ -v ]
+
+.B freport ftest.log ftestd.log
+
+.SH DESCRIPTION
+.LP
+FTester is a tool designed for testing firewalls filtering policies and
+Intrusion Detection System (IDS) capabilities.
+
+.B NOTE: this tool is now outdated and is presented here for historical reasons.
+
+The tool consists of two perl scripts, a packet injector
+.RI ( ftest )
+and the listening sniffer
+.RI ( ftestd ).
+The first script injects custom packets, defined in 
+.I ftest.conf
+, with a signature in the data part while the
+sniffer listens for such marked packets. The scripts both write a log file which 
+is in the same form for both scripts. A 'diff -b' of the two produced files
+.RI ( ftest.log
+and 
+.IR ftestd.log )
+shows the packets that were unable to reach the sniffer due to 
+filtering rules if these two scripts are ran on hosts placed on two different
+sides of a firewall. Stateful inspection firewalls are handled with the 'connection spoofing'
+option. A script called 
+.I freport 
+is also available for automatically
+parse the log files.
+
+Of course this is not an automated process, 
+.I ftest.conf 
+must be crafted for every different situation. Examples and rules are included in the 
+sample configuration file.
+
+The IDS (Intrusion Detection System) testing feature can be used
+either with 
+.I ftest 
+only or with the additional support of 
+.I ftestd 
+for handling stateful inspection IDS, ftest can also use common IDS evasion techniques. Instead 
+of using the configuration syntax the script can also process snort rule definition file.  
+
+.SH OPTIONS
+.SS ftest:
+.TP
+.I -c sourceip:sourceport:destip:destport:flags:protocol:tos 
+Injects a single packet (override -f option).
+.TP
+.I -d delay (es. 0.25 = 250 ms)
+Delay in milliseconds between each packet injection.
+.TP
+.I -e evasion_method
+See the 
+.I IDS EVASION 
+section.
+.TP
+.I -f file
+Read configuration from file.
+.TP
+.I -F
+When in connection spoofing mode terminate (FIN handshake) the created connection, useful if you don't want to flood
+firewall's connection tracking table with established entries, requires ftestd reply (see -s flag).
+.TP
+.I -g fragments_number|fragments_size 
+Split TCP and UDP marked packets in the specified number of IP fragments, useful for checking firewall's 
+fragmentation handling and IDS's fragmentation reassembly. In 'connection spoofing' or 'evasion' mode only packets
+specified in configuration are fragmented and not connection control ones. Obviously 'fragments_number' must be >= 2. If
+the specified number of fragments is incompatible with payload length ftest will automatically set the nearest right value.
+
+Additionaly you can specify the fragments size in bytes if you append the suffix 'b' to the value (es. -g 16b), fragments
+size must be a multiple of 8. If the specified fragment's size is incompatible with payload lenght ftest will automatically
+set the nearest right value. 
+.TP
+.I -k checksum
+Set a custom checksum instead of the right one when sending packets, useful to detect if
+the firewall is blocking invalid packets.
+.TP
+.I -p segments_number|segments_size 
+Specify the number of TCP segments when splitting the tcp stream in evasion mode, see
+.I IDS EVASION
+for details. If the specified number of segments is incompatible with payload length ftest will automatically set the nearest right value.
+
+Additionaly you can specify the segments size in bytes if you append the suffix 'b' to the value (es. -p 16b). If the 
+specified segments's size is incompatible with payload lenght ftest will automatically set the nearest right value. 
+
+If not specified ftest will use the default value of 2 segments.
+.TP
+.I -r
+When in connection spoofing mode reset (RST packet) the created connection, useful if you don't want to flood
+firewall's connection tracking table with established entries, requires ftestd reply (see -s flag).
+.TP
+.I -s time
+Sleep time in seconds for waiting connection spoofing replies, see 'connection spoofing' option.
+.TP
+.I -t ttl
+Time to live that makes the ttl1/ttl2 evasion option packets visible to the IDS but not to the target host.
+.TP
+.I -m marker
+Custom marker string that is appended to the standard signature in generated packets and logs' filenames. Using this option permits multiple instances of ftest/ftestd to run simultaneously without interfering with each other.
+.TP
+.I -v
+Prints to stdout injected packets and be verbose.
+
+.SS ftestd: 
+.TP
+.I -c ttl1:ttl2
+Define TTL settings for the 'connection spoofing' option: 
+set default stack TTL executing `echo "ttl1" > /proc/sys/net/ipv4/ip_default_ttl` (Linux only) and set ftestd 
+reply TTL to ttl2.
+.TP
+.I -g
+Enable fragments reassembly when sniffing packets, useful if you are using ftest fragmentation option and your
+firewall is not performing fragments reassembly.
+.TP
+.I -i interface
+Listen on interface, if not specified will default to the first configured one (excluding loopback).
+.TP
+.I -m marker
+Custom marker string that is tested for in received packets.  Using this option permits multiple instances of ftest/ftestd to run simultaneously without interfering with each other.
+.TP
+.I -v
+Prints to stdout sniffed packets and be verbose.
+
+.SH CONFIGURATION FILE
+
+.I A - flags
+.br
+
+.br
+Command line flags can be overrided with the 'flags:' directive at any point and any time, 
+original flags can be restored with 'flags: restore'. See the man page or `ftest -h` for available flags.
+
+Examples:
+.br
+flags: -d 0.01 -s 1 
+.br
+flags: -e ttl1 -p 4
+.br
+flags: restore
+.br
+
+.br
+.I 1 - basic form 
+.br
+
+.br
+The main configuration file defines which packets ftest will send to ftestd, the basic syntax is the following:
+.TP
+.I Source Address:Source Port:Destination Address:Destination Port:Flags:Protocol:Type of Service
+.TP
+for TCP and UDP packets
+.TP
+.I Source Address:Source Port:Destination Address:Destination Port:Flags:ICMP:icmp_type:icmp_code
+.TP
+for ICMP packets
+.PP
+The
+.I Source Address 
+can be specified as a single IP address, a range of addresses, or a CIDR block.
+.br
+.I Source Port
+and
+.I Destination Port
+can also be specified in ranges.
+.br
+
+Valid
+.I Flags
+are 
+.I A
+(ACK),
+.I F
+(FIN),
+.I P
+(PUSH),
+.I R
+(RST),
+.I S
+(SYN),
+.I U
+(URG).
+
+.I Destination Address 
+must be the host where ftestd is sniffing or one which traffic can be sniffed.
+
+Line beginning with a # are comments and ignored by ftest.
+
+Examples:
+.br
+192.168.22.3:1025:10.7.0.1:80:AP:TCP:0
+.br
+192.168.22.3:1025:10.7.0.1:21:A:TCP:0
+.br
+192.168.22.3:20:10.7.0.1:1025:AP:TCP:10
+.br
+192.168.22.3:53:10.7.0.1:53::UDP:0
+.br
+192.168.22.3:1025:10.7.0.1:80::ICMP:3:5
+.br
+192.168.0.1-255:1024:10.7.0.1:22:S:TCP:0
+.br
+192.168.0.1:1-1024:10.7.0.1:20-25:S:TCP:22
+.br
+192.168.0.23:666:10.7.0.1:1-65535:A:TCP:0
+.br
+192.168.3.0/24:1024:10.7.0.1:22:S:TCP:0
+.br
+192.168.3.128/25:1-1024:10.7.0.1:20-25:S:TCP:22
+.br
+192.168.0.0/22:666:10.7.0.1:1-65535:A:TCP:0
+.br
+
+.br
+.I 2 - connection spoofing
+.br
+
+.br
+ftest and ftestd are capable of simulating a real connection, this is extremly useful
+when you are dealing with a stateful detection firewall (like netfilter) that blocks packets
+unrelated to an ongoing connection. In such cases packets like 
+192.168.22.3:1025:10.7.0.1:80:AP:TCP:0 are likely to be blocked by the firewall if their 
+sequence numbers and flags aren't syncronised with a previously started connection.
+In order to circumvent this problem if the packets are specified with the 'connect=' prefix
+ftest and ftestd will act in this way:
+
+ a) ftest will send 192.168.22.3:1025:10.7.0.1:80:S:TCP:0 with a custom payload and sequence
+    number set to $random_1, the payload size is 8 byte. Then it sleeps for a custom time waiting
+    for the firewall to see the packet specified in b).
+ 
+ b) ftestd will recognize this packet and will send 10.7.0.1:80:192.168.22.3:1025 with
+    sequence number $random_2+1024 and acknowledge number ($random_1+payload_size+1).
+ 
+ c) ftest, after the sleep period, will complete the connection handshake sending
+    192.168.22.3:1025:10.7.0.1:80:A:TCP:0 with sequence number $random_1+payload_size+1 and 
+    acknowledge number $random_2+1024+1
+ 
+ d) ftest will finally send the specified packet with sequence number $random_1+payload+size+1 and 
+    acknowledge number $random_2+1024+1
+ 
+ e) ftestd acknowledge packet d)
+
+now there is one great problem with this approach, the stack of the destination host will
+reply to the packet sent in a) and the real host we've spoofed will reply to it resetting the connection.
+So we have to do two things, hiding the stack response to the spoofed host and to the firewall
+and make sure that ftestd reply will traverse the firewall by not reaching the spoofed host.
+Hiding the stack response could be done by setting a very low default TTL in
+/proc/sys/net/ipv4/ip_default_ttl (Linux only). Hiding to the spoofed host our reply ( b) ) is done 
+by setting its TTL to a low value equal to the hop delay between ftestd and the firewall. For example 
+use ./ftestd -c 0:3 for temporarly setting default stack ttl to 0 and ftestd reply ttl to 3, the 
+ip_default_ttl will be restored when a stop_signal is received.
+
+.I WARNING: if you interrupt ftestd execution and a stop_signal is not sniffed your default ttl will
+.I remain low! Manually restore the default value with 'echo 64 > /proc/sys/net/ipv4/ip_default_ttl'. 
+
+NOTE: you can avoid this ttl mess by firewalling the input chain of the host or using a unallocated 
+IP address published with a spoofed arp response. 
+
+Remember to specify different sport-dport pairs if you use this mode again with the same saddr-daddr
+and you're not using the -r/-F flag. Use the -s flag for setting the sleep time duration.
+
+Packets a),b),c),e) are NOT logged.
+
+Examples:
+.br
+connect=192.168.0.1:1025:10.7.0.1:22:AP:TCP:0
+.br
+connect=192.168.0.1-255:1025-2000:10.7.0.1:53:AP:TCP:0
+.br
+connect=192.168.0.0/24:1025:10.7.0.1:1-1024:AP:TCP:0
+.br
+
+.br
+.I 3 - stop signal 
+.br
+
+.br
+The stop signal tells ftestd to close the log file and die, obviously you must
+ensure that this packet will reach the sniffer.
+
+Examples:
+.br
+stop_signal=192.168.0.1:666:10.7.0.1:666:S:TCP:0
+.br
+
+.br
+.I 4 - IDS testing
+.br
+
+.br
+ftest has an additional syntax, useful for test Intrusion Detection System, that permits the definition
+of the payload. The support of ftestd is not necessary in this mode since mainly you have to check your 
+IDS logs, however there is an "ids-conn" option that works just like the "connect" option, useful if your
+IDS is performing stateful inspection. 
+
+See also the 
+.I IDS EVASION 
+section. 
+
+Examples:
+.br
+ids=192.168.0.1:1025:10.7.0.1:25:S:TCP:0:VRFY
+.br
+ids=192.168.0.1::10.7.0.1:::ICMP:8:0:+++ath
+.br
+ids-conn=192.168.0.1:23:10.7.0.1:1025:PA:TCP:0:to su root
+.br
+ids-conn=192.168.0.1:1025:10.7.0.1:80:PA:TCP:0:cmd.exe
+.br
+ids-conn=192.168.0.1:1026:10.7.0.1:80:PA:TCP:0:ftp.exe
+.br
+
+In addition you can use the following syntax to directly use a 
+.I snort 
+.RB ( http://www.snort.org ) 
+rule definition file. The "insert-conn" option make ftest work as in the "connection spoofing" mode for packets 
+with flags different than SYN. Source, destination IP and ToS must be specified. 
+
+The following keywords are currently supported:
+
+content - flags - offset - dsize
+
+source and destination port are randomly selected if specified as 'any', in the case that a sport-dport pair 
+is incidentally repeated connection spoofing mode won't work unless you're using the -r/-F flag.
+
+Examples:
+.br
+insert /etc/snort/exploit.rules 192.168.0.1 10.7.0.1 0
+.br
+insert-conn /etc/snort/exploit.rules 192.168.0.1 10.7.0.1 0
+.br
+
+.SH IDS EVASION
+
+A number of IDS evasion techniques are implemented, you can activate them with the -e flag when using 'ids-conn'
+and 'insert-conn' modes. TCP splitting can be controlled with the -p flag (see
+.IR OPTIONS ).
+
+.TP
+.I -e stream
+
+.br
+packet => [packet1(ATT) + packet2(ACK)]
+.br
+
+Simple splitting of the tcp stream
+.TP
+.I -e stream1
+
+.br
+packet => [packet1(ATT) + packet(GARBAGE) [invalid checksum] + packet2(ACK)]
+.br
+
+The IDS will see 'ATTGARBAGEACK' instead of 'ATTACK' if it's not performing checksum analysis
+.TP
+.I -e ttl1
+
+.br
+packet => [packet1(ATT) [ttl n] + packet(GARBAGE) [ttl p] + packet2(ATT) [ttl n]]
+.br
+
+The IDS will see 'ATTGARBAGEACK' if p is a TTL sufficient to reach the IDS but not the target host. The ttl can
+be specified with the -t flag (see OPTIONS)
+.TP
+.I -e rst1
+
+.br
+packet => [packet1(ATT) + rst [invalid checksum] + packet2(ACK)]
+.br
+
+If the IDS is performing a poor connection tracking and it's not performing checksum analysis it will close
+the connection ignoring subsequent packets
+.TP
+.I -e rst2
+
+.br
+packet => [packet1(ATT) [ttl n] + rst [ttl p] + packet2(ACK) [ttl n]]
+.br
+
+The IDS will close the connection if p is a TTL sufficient to reach the IDS but not the target host. The ttl can
+be specified with the -t flag (see OPTIONS)
+.TP
+.I -e desync1
+
+.br
+packet => [packet1(ATT) + syn [wrong ack] + packet2(ACK)]
+.br
+
+If the IDS is performing a poor connection tracking it will resynchronize the connection against the wrong sequence 
+numbers of the post-connection SYN
+.TP
+.I -e desync2
+
+.br
+packet => [syn [wrong ack+invalid checksum] + syn + packet1(ATT) + packet2(ACK)]
+.br
+
+If the IDS is performing connection tracking with no checksum analysis it will synchronize the connection against the
+wrong sequence numbers of the pre-connection SYN
+.TP
+.I -e frag1
+
+.br
+packet => [fragment3(C) + fragment2(TA) + fragment1(AT) + fragment4(K)]
+.br
+
+If the IDS can't correctly handle out of order IP fragments it won't reassemble the packet 
+.TP
+.I -e frag2
+
+.br
+packet => [fragment4(K) + fragment3(C) + fragment2(TA) + fragment1(AT)]
+.br
+
+Like frag1 but send the last fragment first
+.TP
+.I -e frag3
+
+.br
+packet => [fragment1(AT) + fragment2(TA) + fragment3(C) + fragment3(C) + fragment4(K)]
+.br
+
+Duplicate the penultimate fragment
+.TP
+.I -e frag4
+
+.br
+packet => [fragment1(AT) + fragment1(OO) + fragment3(TACK)]
+.br
+
+Duplicate the first fragment with garbage data. Overlap attack effective if the IDS favors new data and 
+the host favors old data. 
+.TP
+.I -e frag5
+
+.br
+packet => [fragment1(OO) + fragment1(AT) + fragment3(TACK)]
+.br
+
+Send the first fragment with garbage data then duplicate it with correct payload. Overlap attack effective 
+if the IDS favors old data and the host favors new data. 
+.TP
+
+A detailed explanation can be find in the following documents:
+
+.I Phrack Magazine, Volume 8, Issue 54 Dec 25th, 1998, article 10 (P54-10)
+.br
+.I Insertion, Evasion, and Denial of Service: Eluding Network Intrusion Detection - Thomas H. Ptacek, Timothy N.Newsham.
+(http://www.nai.com/media/ps/nai_labs/ids.ps) 
+
+.SH FILES
+.TP
+.B ftest.conf
+Main configuration file.
+.TP
+.B ftest.log
+Log file generated by ftest.
+.TP
+.B ftestd.log
+Log file generated by ftestd.
+
+.SH EXAMPLES
+See the included ftest.conf.
+
+.SH REQUIREMENTS
+Net::RawIP, Net::PcapUtils, NetPacket are required, you can grab them at www.cpan.org or using
+your CPAN shell (`perl -e shell -MCPAN`). 
+
+.SH BUGS
+
+Snort rules parsing is far from perfect, multiple content rules won't work and non-content rules are skipped
+as well as ip only ones. Additionally variables such as $HTTP_PORTS are currently not recognized and will create
+problems (fix is coming soon, in the meantime sed is your friend ;) ).
+
+ftestd -c flag works only on Linux.
+
+Please report any bugs you find to <andrea@inversepath.com>
+
+.SH TODO
+- add an option for sending fragments with splitted 
+TCP/UDP header
+.br 
+- add a
+.I OSSTMM (http://www.isecom.org/projects/osstmm.htm)
+compliant configuration template (in progress)
+.br
+- implement other evasion techniques (suggestions?)
+.br
+- throughput test and report
+.br
+- improve snort conf parsing
+.br
+- make ftestd -c flag compatible with other platforms
+.br
+- perl-tk graphic frontend (in progress)
+.br
+- use warnings
+
+Any volounteers ? ;)
+
+.SH LICENSE
+The
+.B FTester
+is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License version 2 as 
+published by the Free Software Foundation.
+
+.SH AUTHOR
+.B Andrea Barisani
+.BI <andrea@inversepath.com>
+
+.B NOTE: this tool is now outdated and is presented here for historical reasons.
+
+.SH NOTES
+
+The IDS testing option that injects packets reading snort configuration files is designed
+to test the IDS engine and NOT it's efficiency in detecting real world attacks, the 
+detection of an attack involve multiple events and often human intervention to do proper
+correlation. The ftester can only be useful to verify things like the IDS placement,
+stateful inspection, fragmention handling, overall speed and so on. Keep this in mind when
+using this tool.
+
+.SH SEE ALSO
+
+A very similiar tool is the 
+.I filterrules 
+package, you can find it at 
+.BI http://www.hsc.fr/ressources/outils/filterrules/index.html.en
+
+Another snort false positive generator is 
+.I sneeze
+, you can find it at
+.BI http://snort.sourceforge.net/sneeze-1.0.tar
+
+.I Fragrouter,
+.BI http://www.anzen.com/research/nidsbench 
+
+.I Fragroute,
+.BI http://www.monkey.org/~dugsong/fragroute
+
+.I Stevens, W.Richard. TCP/IP Illustrated, Volume One: The Protocols. Reading, MA: Addison-Wesley. 1994.

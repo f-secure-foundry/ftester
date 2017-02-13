@@ -1,0 +1,77 @@
+1.0
+
+* added marker feature for running multiple ftest/ftestd instances
+* configuration directives lookup is now anchored properly
+* fixed IP ID field logging bug when max value is reached 
+
+0.9
+
+* added support for CIDR notation 
+* extended ranges and CIDR notation support to all modes
+* added new configuration syntax 'flags:' 
+* added pseudo fragments reassembly in ftestd
+* added README.redhat 
+* minor code rewrite and cleanup
+
+0.8
+
+* fixed 'use strict' problems with perl 5.8.0
+* added README file
+* minor documentation changes
+
+0.7
+
+* added fragmentation option for TCP and UDP packets (-g flag)
+* added segmentation option for TCP splitting (-p flag)
+* added fragmentation related evasion methods 
+* connection spoofing syntax now support extended form
+* removed ftest-ids.log output, now all logs are in ftest.log
+* freport now doesn't print empty lines
+* fixed ftest double logging bug
+* major ftest main loop rewrite
+* minor code cleanup and various bugfixes 
+* minor cosmetic changes
+
+0.6
+
+* added the IDS testing option
+* added the ability to read snort rule definition files
+* fixed a sequence number error in the connection spoofing code
+* randomized connection spoofing sequence numbers
+* added option for resetting spoofed connections (-r flag)
+* added option for gracefully terminate spoofed connections (-F flag)
+* added IDS evasion techniques (-e flag)
+* added interface specification in ftestd (-i flag)
+* indentation and style cleanup (thanks perltidy! ;) )
+
+0.5
+
+* code cleanup and bugfixes, now all scripts are under 'strict'
+* added man page ftester.8
+
+0.4
+
+* added cli-based packet injection options (override ftest.conf)
+* single packets are now tracked also with IP ID field  
+* added freport for parsing ftest and ftestd log files
+
+0.3
+
+* added the ability of spoofing real connections for handling
+  stateful detection firewalls. (see ftest.conf for details)
+* added -s option in ftest.pl (see ftest.conf for details)
+* added -c option in ftestd.pl (see ftest.conf for details)
+
+0.2
+
+* added Type of Service manipulation
+* added checksum manipulation
+* added verbose options in ftest.pl and ftestd.pl
+* now ftest.pl print the last parsed conf line when it dies
+* now flags are reported alphabetically in log files
+* added report.sh
+* correct a wrong entry in ftest.conf
+
+0.1
+
+* first release
